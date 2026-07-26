@@ -5,8 +5,12 @@ import argparse
 import re
 import sys
 import os
-from scapy.all import IP, TCP, sr1, send, ICMP
+from scapy.all import IP, TCP, sr1, send, ICMP, arping
 import threading
+import ipaddress
+import logging
+
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 def silent_excepthook(args):
     if "sndrcv" in str(args.thread.name):
@@ -44,12 +48,16 @@ hostScan = args.sH
 timing = args.timing
 ports = args.port
 
+scanned_hosts = []
+
 open_ports = []
 closed_ports = []
 scanned_ports = []
 openFiltered_ports =[]
+TCP_PORTS = []
+UDP_PORTS = []
 
-valid_hosts = []
+valid_hosts = set()
 
 portPattern = r'^\d+(-\d+)?(,\d+(-\d+)?)*$'
 
@@ -57,6 +65,42 @@ def load_ports(filepath):
         with open(filepath,'r') as f:
                 return [int(line.strip()) for line in f if line.strip()]
 
+def parse_hosts(HOST):
+        parts = HOST.split(',')
+        global scanned_hosts
+        for part in parts:
+                if '-' in part:
+                        try:
+                                arping(part, timeout=2, verbose=0)
+                                start_ip = ipaddress.ip_address(part.split('-')[0])
+                                end_ip = ipaddress.ip_address(part.split('-')[1])
+                                if(start_ip > end_ip):
+                                        print("Invalid IP Range")
+                                        return
+                                current_ip = start_ip
+                                while current_ip <= end_ip:
+                                        scanned_hosts.append(str(current_ip))
+                                        current_ip = current_ip + 1
+                        except ValueError:
+                                print("Invalid IP format")
+                                return
+                elif '/' in part:
+                        try:
+                                arping(part, timeout=2, verbose=0)
+                                net = ipaddress.ip_network(part, strict=False)
+                                for ip in net.hosts():
+                                        scanned_hosts.append(str(ip))
+                        except ValueError:
+                                print("Invalid CIDR format")
+                                return
+                else:
+                        try:
+                                arping(part, timeout=2, verbose=0)
+                                ip = ipaddress.ip_address(part)
+                                scanned_hosts.append(str(ip))
+                        except ValueError:
+                                print(f"Invalid IP address:{part}")
+                                return
 
 def tcp_scan_port(HOST, PORT):
         global open_ports, closed_ports
@@ -67,7 +111,6 @@ def tcp_scan_port(HOST, PORT):
                 open_ports.append(PORT)
         except:
                 closed_ports.append(PORT)       
-
 
 def udp_scan_port(HOST, PORT):
         global open_ports, closed_ports, openFiltered_ports
@@ -84,7 +127,6 @@ def udp_scan_port(HOST, PORT):
                 openFiltered_ports.append(PORT)
         finally:
                 s.close()
-
 
 def syn_scan_port(HOST, PORT):
         global open_ports, closed_ports
@@ -104,8 +146,7 @@ def syn_scan_port(HOST, PORT):
                                 closed_ports.append(PORT)
         except Exception as e:
                 pass
-
-        
+    
 def fin_scan_port(HOST, PORT):
         global open_ports, closed_ports, openFiltered_ports
         try:
@@ -122,127 +163,170 @@ def fin_scan_port(HOST, PORT):
         except Exception as e:
                 pass
                                        
-
 def host_scan(HOST):
         global valid_hosts
         try:
                 packet = IP(dst=HOST) / ICMP()
-                response = sr1(packet, timeout=1, verbose=0)
+                response = sr1(packet, timeout=0.2, verbose=0)
                 if response and response.haslayer(ICMP) and response.getlayer(ICMP).type == 0:
-                        valid_hosts.append(HOST)
+                        valid_hosts.add(HOST)
                         return
                 packet = IP(dst=HOST) / TCP(dport=443, flags='S')
-                response = sr1(packet, timeout=1, verbose=0)
+                response = sr1(packet, timeout=0.2, verbose=0)
                 if(response and response.haslayer(TCP) and response[TCP].flags == 'SA'):
-                        valid_hosts.append(HOST)
+                        valid_hosts.add(HOST)
                         return
                 packet = IP(dst=HOST) / TCP(dport=80, flags='A')
-                response = sr1(packet, timeout=1, verbose=0)
+                response = sr1(packet, timeout=0.2, verbose=0)
                 if(response and response.haslayer(TCP) and response[TCP].flags == 'R'):
-                        valid_hosts.append(HOST)
+                        valid_hosts.add(HOST)
                         return
                 packet = IP(dst=HOST) / ICMP(type=13)
-                response = sr1(packet, timeout=1, verbose=0)
+                response = sr1(packet, timeout=0.2, verbose=0)
                 if(response and response.haslayer(ICMP) and response.getlayer(ICMP).type == 14):
-                        valid_hosts.append(HOST)
+                        valid_hosts.add(HOST)
                         return
         except Exception as e:
                 pass
-                
-                
-if(ports!=None):
-        if(re.fullmatch(portPattern,ports) == None):
-                print("Thrown error - port argument doesn't match the supported format")
-                sys.exit(1)
-        else:
-                ports = ports.strip()
-                portData = ports.split(',')
-                for part in portData:
-                        if '-' in part:
-                                start = int(part.split('-')[0])
-                                end = int(part.split('-')[1])
-                                for i in range(start,end+1):
-                                        scanned_ports.append(i)
-                        else:
-                                scanned_ports.append(int(part))
-else:
-        TCP_PORTS = load_ports('data/top_tcp_ports.txt')
-        UDP_PORTS = load_ports('data/top_udp_ports.txt')                              
-                   
 
-if(conScan):
+def initial_scan():           
+        parse_hosts(args.host)
+        if((args.sT or args.sU or args.sF or args.sS) and args.sH == False):
+                with ThreadPoolExecutor(max_workers=50) as executor:
+                        for HOST in scanned_hosts:
+                                executor.submit(host_scan, HOST)
+
+def initialize_ports():
+        global ports, TCP_PORTS, UDP_PORTS, scanned_ports, valid_ports
+        if(ports!=None):
+                if(re.fullmatch(portPattern,ports) == None):
+                        print("Thrown error - port argument doesn't match the supported format")
+                        sys.exit(1)
+                else:
+                        ports = ports.strip()
+                        portData = ports.split(',')
+                        for part in portData:
+                                if '-' in part:
+                                        start = int(part.split('-')[0])
+                                        end = int(part.split('-')[1])
+                                        for i in range(start,end+1):
+                                                scanned_ports.append(i)
+                                else:
+                                        scanned_ports.append(int(part))
+        else:
+                TCP_PORTS = load_ports('data/top_tcp_ports.txt')
+                UDP_PORTS = load_ports('data/top_udp_ports.txt')        
+
+def execute_con_scan():
+        global ports, TCP_PORTS, UDP_PORTS, scanned_ports, valid_ports
         if(synScan or udpScan or finScan or hostScan):
                 print("Please choose only one scan type")
         else:
                 if(ports==None):
                         scanned_ports = TCP_PORTS
-                print(f"Executing TCP Connect Scan on host {HOST}: ")
-                with ThreadPoolExecutor(max_workers=100) as executor:
-                        for PORT in scanned_ports:
-                                executor.submit(tcp_scan_port, HOST, PORT)
-        print(f"\n----------------------------------------------")
-        print(f"Port       -      Status      -       Protocol")
-        print(f"----------------------------------------------")
-        for port in open_ports:
-                print(f"{port}       -       Open       -       Protocol")
+                for HOST in sorted(valid_hosts):
+                        open_ports.clear()
+                        print(f"\nExecuting TCP Connect Scan on host {HOST}: ")
+                        with ThreadPoolExecutor(max_workers=100) as executor:
+                                for PORT in scanned_ports:
+                                        executor.submit(tcp_scan_port, HOST, PORT)
+                        print(f"\n----------------------------------------------")
+                        print(f"Port       -      Status      -       Protocol")
+                        print(f"----------------------------------------------")
+                        for port in open_ports:
+                                print(f"{port}       -       Open       -       Protocol")
 
-elif(udpScan):
-       
+def execute_udp_scan():
+        global ports, TCP_PORTS, UDP_PORTS, scanned_ports, valid_ports, open_ports, closed_ports, openFiltered_ports
         if(synScan or conScan or finScan or hostScan):
                 print("Please choose only one scan type")
         else:
                 if(ports==None):
                         scanned_ports = UDP_PORTS
-                print(f"Executing UDP Scan on {HOST}: ")
-                with ThreadPoolExecutor(max_workers=30) as executor:
-                        for PORT in scanned_ports:
-                                executor.submit(udp_scan_port, HOST, PORT)
-                print(f"Open ports: {sorted(open_ports)}")
-                print(f"Closed ports: {sorted(closed_ports)}")
-                print(f"Open or filtered ports: {sorted(openFiltered_ports)}")
+                for HOST in sorted(valid_hosts):
+                        open_ports.clear()
+                        print(f"Executing UDP Scan on {HOST}: ")
+                        with ThreadPoolExecutor(max_workers=30) as executor:
+                                for PORT in scanned_ports:
+                                        executor.submit(udp_scan_port, HOST, PORT)
+                        open_ports = list(set(open_ports))
+                        closed_ports = list(set(closed_ports))
+                        openFiltered_ports = list(set(openFiltered_ports))
+                        print(f"\n----------------------------------------------")
+                        print(f"Port       -      Status      -       Protocol")
+                        print(f"----------------------------------------------")
+                        for port in sorted(open_ports):
+                                print(f"{port}       -       Open       -       Protocol")
+                        for port in sorted(openFiltered_ports):
+                                print(f"{port}       -    Open/Filtered    -       Protocol")
 
-                
-elif(synScan):
+def execute_syn_scan():
+        global ports, TCP_PORTS, UDP_PORTS, scanned_ports, valid_ports
         if(conScan or udpScan or finScan or hostScan):
                 print("Please choose only one scan type")
         else:
                 if(ports==None):
                         scanned_ports = TCP_PORTS
-                print(f"Executing TCP Syn Scan on {HOST}: ")
-                with ThreadPoolExecutor(max_workers=50) as executor:
-                        for PORT in scanned_ports:
-                                executor.submit(syn_scan_port, HOST, PORT)
-                print(f"\n----------------------------------------------")
-                print(f"Port       -      Status      -       Protocol")
-                print(f"----------------------------------------------")
-                for port in sorted(open_ports):
-                        print(f"{port}       -       Open       -       Protocol")
+                for HOST in sorted(valid_hosts):
+                        open_ports.clear()
+                        print(f"Executing TCP Syn Scan on {HOST}: ")
+                        with ThreadPoolExecutor(max_workers=50) as executor:
+                                for PORT in scanned_ports:
+                                        executor.submit(syn_scan_port, HOST, PORT)
+                        print(f"\n----------------------------------------------")
+                        print(f"Port       -      Status      -       Protocol")
+                        print(f"----------------------------------------------")
+                        for port in sorted(open_ports):
+                                print(f"{port}       -       Open       -       Protocol")
 
-elif(finScan):
+def execute_fin_scan():
+        global ports, TCP_PORTS, UDP_PORTS, scanned_ports, valid_ports
         if(conScan or udpScan or synScan or hostScan):
                 print("Please choose only one scan type")
         else:
                 if(ports==None):
                         scanned_ports = TCP_PORTS
-                print(f"Executing TCP Fin Scan on {HOST}: ")
-                with ThreadPoolExecutor(max_workers=50) as executor:
-                        for PORT in scanned_ports:
-                                executor.submit(fin_scan_port, HOST, PORT)
-                print(f"\n----------------------------------------------")
-                print(f"Port       -      Status      -       Protocol")
-                print(f"----------------------------------------------")
-                for port in sorted(open_ports):
-                        print(f"{port}       -       Open       -       Protocol")
+                for HOST in sorted(valid_hosts):
+                        open_ports.clear()
+                        print(f"Executing TCP Fin Scan on {HOST}: ")
+                        with ThreadPoolExecutor(max_workers=50) as executor:
+                                for PORT in scanned_ports:
+                                        executor.submit(fin_scan_port, HOST, PORT)
+                        print(f"\n----------------------------------------------")
+                        print(f"Port       -      Status      -       Protocol")
+                        print(f"----------------------------------------------")
+                        for port in sorted(open_ports):
+                                print(f"{port}       -       Open       -       Protocol")
 
-elif(host_scan):
+def execute_host_scan():
+        global ports, TCP_PORTS, UDP_PORTS, scanned_ports, valid_ports
         if(conScan or udpScan or synScan or finScan):
                 print("Please choose only one scan type")
         else:
-                print(f"Executing Host Discovery Scan on {HOST}")
-                host_scan(HOST)
+                print(f"Executing Host Discovery Scan on {args.host}")
+                with ThreadPoolExecutor(max_workers=50) as executor:
+                        for HOST in scanned_hosts:
+                                executor.submit(host_scan, HOST)
                 print(f"\n-------------------------------------")
                 print(f"Host                 -     Status")
                 print(f"-------------------------------------")
-                for host in valid_hosts:
+                for host in sorted(valid_hosts):
                         print(f"{host}       -      Open")
                 print("\n")
+
+
+def run():
+        initial_scan()
+        initialize_ports()
+        if(conScan):
+                execute_con_scan()
+        elif(udpScan):
+                execute_udp_scan()
+        elif(synScan):
+                execute_syn_scan()
+        elif(finScan):
+                execute_fin_scan()
+        elif(hostScan):
+                execute_host_scan()
+
+run()
