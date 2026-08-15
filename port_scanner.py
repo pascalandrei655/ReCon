@@ -28,7 +28,7 @@ parser = argparse.ArgumentParser(
 )
 
 mandatory = parser.add_argument_group("Mandatory arguments")
-mandatory.add_argument("-H", "--host", help="Host to perform the scan on. Eg: 192.168.56.101")
+mandatory.add_argument("-H", "--host", help="Host to perform the scan on. Eg: 192.168.56.101",required=True)
 mandatory.add_argument("-sS",action="store_true", help="TCP SYN Scan")
 mandatory.add_argument("-sU",action="store_true", help="UDP Scan")
 mandatory.add_argument("-sF",action="store_true", help="TCP FIN Scan")
@@ -71,6 +71,13 @@ TIMING_PROFILES = {
         "5": {"timeout": 0.3, "workers": 200}
 }
 
+def is_hostname(HOST):
+        try:
+                ipaddress.ip_address(HOST)
+                return False
+        except ValueError:
+                return True
+        
 def load_ports(filepath):
         with open(filepath,'r') as f:
                 return [int(line.strip()) for line in f if line.strip()]
@@ -94,7 +101,20 @@ def parse_hosts(HOST):
         parts = HOST.split(',')
         global scanned_hosts
         for part in parts:
-                if '-' in part:
+                if(is_hostname(part)):
+                        try:
+                                part = socket.gethostbyname(part)
+                                try:
+                                        arping(part, timeout=timing_profile["timeout"], verbose=0)
+                                        ip = ipaddress.ip_address(part)
+                                        scanned_hosts.append(str(ip))
+                                except ValueError:
+                                        print(f"Invalid IP address:{part}")
+                                        return      
+                        except socket.gaierror:
+                                print(f"Could not resolve hostname: {part}")
+                                continue
+                elif '-' in part:
                         try:
                                 arping(part, timeout=timing_profile["timeout"], verbose=0)
                                 start_ip = ipaddress.ip_address(part.split('-')[0])
