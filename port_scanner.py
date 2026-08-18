@@ -60,6 +60,7 @@ TCP_PORTS = []
 UDP_PORTS = []
 
 valid_hosts = set()
+hostname_map = dict()
 
 portPattern = r'^\d+(-\d+)?(,\d+(-\d+)?)*$'
 
@@ -103,7 +104,8 @@ def parse_hosts(HOST):
         for part in parts:
                 if(is_hostname(part)):
                         try:
-                                part = socket.gethostbyname(part)
+                                hostname_map[socket.gethostbyname(part)] = part
+                                part = socket.gethostbyname(part)                     
                                 try:
                                         arping(part, timeout=timing_profile["timeout"], verbose=0)
                                         ip = ipaddress.ip_address(part)
@@ -145,8 +147,7 @@ def parse_hosts(HOST):
                                 scanned_hosts.append(str(ip))
                         except ValueError:
                                 print(f"Invalid IP address:{part}")
-                                return      
-
+                                return
 def tcp_scan_port(HOST, PORT):
         global open_ports, closed_ports
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -272,7 +273,8 @@ def execute_con_scan():
                         scanned_ports = TCP_PORTS
                 for HOST in sorted(valid_hosts):
                         open_ports.clear()
-                        print(f"\nExecuting TCP Connect Scan on host {HOST}: ")
+                        printed_host = hostname_map.get(HOST, HOST)
+                        print(f"\nExecuting TCP Connect Scan on host {printed_host}: ")
                         with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
                                 for PORT in scanned_ports:
                                         executor.submit(tcp_scan_port, HOST, PORT)
@@ -291,7 +293,8 @@ def execute_udp_scan():
                         scanned_ports = UDP_PORTS
                 for HOST in sorted(valid_hosts):
                         open_ports.clear()
-                        print(f"Executing UDP Scan on {HOST}: ")
+                        printed_host = hostname_map.get(HOST, HOST)
+                        print(f"Executing UDP Scan on {printed_host}: ")
                         with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
                                 for PORT in scanned_ports:
                                         executor.submit(udp_scan_port, HOST, PORT)
@@ -315,7 +318,8 @@ def execute_syn_scan():
                         scanned_ports = TCP_PORTS
                 for HOST in sorted(valid_hosts):
                         open_ports.clear()
-                        print(f"Executing TCP Syn Scan on {HOST}: ")
+                        printed_host = hostname_map.get(HOST, HOST)
+                        print(f"Executing TCP Syn Scan on {printed_host}: ")
                         with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
                                 for PORT in scanned_ports:
                                         executor.submit(syn_scan_port, HOST, PORT)
@@ -334,7 +338,8 @@ def execute_fin_scan():
                         scanned_ports = TCP_PORTS
                 for HOST in sorted(valid_hosts):
                         open_ports.clear()
-                        print(f"Executing TCP Fin Scan on {HOST}: ")
+                        printed_host = hostname_map.get(HOST, HOST)
+                        print(f"Executing TCP Fin Scan on {printed_host}: ")
                         with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
                                 for PORT in scanned_ports:
                                         executor.submit(fin_scan_port, HOST, PORT)
@@ -349,7 +354,8 @@ def execute_host_scan():
         if(conScan or udpScan or synScan or finScan):
                 print("Please choose only one scan type")
         else:
-                print(f"Executing Host Discovery Scan on {args.host}")
+                printed_host = hostname_map.get(args.host, args.host)
+                print(f"Executing Host Discovery Scan on {printed_host}")
                 with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
                         for HOST in scanned_hosts:
                                 executor.submit(host_scan, HOST)
@@ -377,4 +383,5 @@ def run():
         elif(hostScan):
                 execute_host_scan()
 
-run()
+if __name__ == "__main__":
+    run()

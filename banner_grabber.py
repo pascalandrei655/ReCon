@@ -268,4 +268,5 @@ def run():
                 print(banners[PORT])
                 print('\n')
                 
-run()
+if __name__ == "__main__":
+    run()
