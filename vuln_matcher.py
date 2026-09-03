@@ -9,7 +9,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import json
 import ssl
+import os
+from dotenv import load_dotenv
+import requests
 
+load_dotenv()
+NVD_API_KEY = os.getenv("NVD_API_KEY")
 
 
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
@@ -33,12 +38,16 @@ mandatory.add_argument("-H", "--host", help="Host to perform the scan on. Eg: 19
 optional = parser.add_argument_group("Optional arguments")
 optional.add_argument("-t", "--timing", help="1 - Stealthy; 2 - Calm; 3 - Normal; 4 - Fast; 5 - Aggressive")
 optional.add_argument("-p", "--port", help="Ports to scan. Eg: 80; 21,22,80; 1-1023")
+optional.add_argument("-c", "--vuln-count", help="Number of vulnerabilities to show. Defaults to 10")
 
 args = parser.parse_args()
 
 HOST = args.host
 ports = args.port
 timing = args.timing
+vuln_count = args.vuln_count
+if vuln_count is None:
+        vuln_count = 10
 
 valid_hosts = set()
 scanned_hosts = []
@@ -258,7 +267,7 @@ def split_banner_lines(banner):
 
 def find_server(lines):
         for line in lines:
-                if line.startswith("Server:"):
+                if line.lower().startswith("server:"):
                         return line
         return None
 
@@ -270,11 +279,10 @@ def find_backend(lines):
 
 def parse_ssh(banner):
         components = {}
-        pattern = r'(\d+\.\d+)-([A-Za-z]*)_(\d+\.\d+[A-Za-z0-9]*)'
+        pattern = r'SSH-\d+\.\d+-([A-Za-z0-9\.-]+?)[\_\-Vv/]([A-Za-z0-9\.-]+)'
         match = re.search(pattern, banner)
-        components["SSH_Version"] = match.group(1) if match and match.group(1) else "Unknown"
-        components["OpenSSH"] = match.group(2) if match and match.group(2) else "Unknown"
-        components["OpenSSH_Version"]=match.group(3) if match and match.group(3) else "Unknown"
+        components["Product"] = match.group(1) if match and match.group(1) else "Unknown"
+        components["Version"]=match.group(2) if match and match.group(2) else "Unknown"
         return components
 
 def parse_http(banner):
@@ -282,20 +290,29 @@ def parse_http(banner):
         server_line = find_server(lines)
         backend_line = find_backend(lines)
         components = {}
-        server_pattern = r'([A-Za-z]*)/(\d+\.\d+\.\d+)'
-        backend_pattern = r'([A-Za-z]*)/(\d+\.\d+\.\d+)-([A-Za-z0-9\.]*)'
-        server_match = re.search(server_pattern, server_line)
-        backend_match = re.search(backend_pattern, backend_line)
-        components["Server"] = server_match.group(1) if server_match and server_match.group(1) else "Unknown"
-        components["Server_Version"] = server_match.group(2) if server_match and server_match.group(2) else "Unknown"
-        components["Language"] = backend_match.group(1) if backend_match and backend_match.group(1) else "Unknown"
-        components["Clean_Version"] = backend_match.group(2) if backend_match and backend_match.group(2) else "Unknown"
-        components["SO_Version"] = backend_match.group(3) if backend_match and backend_match.group(3) else "Unknown"
+        if server_line:
+                server_pattern = r'([A-Za-z\-]*)(?:/(\d+\.\d+(?:\.\d+)?))?'
+                server_match = re.search(server_pattern, server_line)
+                components["Server"] = server_match.group(1) if server_match and server_match.group(1) else "Unknown"
+                components["Server_Version"] = server_match.group(2) if server_match and server_match.group(2) else "Unknown"
+        else:
+                components["Server"] = "Unknown"
+                components["Server_Version"] = "Unknown"
+        if backend_line:
+                backend_pattern = r'([A-Za-z\.\-]+)(?:/(\d+(?:\.\d+)*?)(?:-([A-Za-z0-9\.\-]*))?)?'
+                backend_match = re.search(backend_pattern, backend_line)
+                components["Language"] = backend_match.group(1) if backend_match and backend_match.group(1) else "Unknown"
+                components["Clean_Version"] = backend_match.group(2) if backend_match and backend_match.group(2) else "Unknown"
+                components["SO_Version"] = backend_match.group(3) if backend_match and backend_match.group(3) else "Unknown"
+        else:
+                components["Language"] = "Unknown"
+                components["Clean_Version"] = "Unknown"
+                components["SO_Version"] = "Unknown"
         return components
 
 def parse_ftp(banner):
         components = {}
-        pattern = r'([A-Za-z0-9]*)\s(\d+\.\d+\.\d+)'
+        pattern = r'([A-Za-z0-9\.\-]+)\s+v?(\d+(?:\.\d+)+)'
         match = re.search(pattern, banner)
         components["Server"] = match.group(1) if match and match.group(1) else "Unknown"
         components["Version"] = match.group(2) if match and match.group(2) else "Unknown"
@@ -303,63 +320,155 @@ def parse_ftp(banner):
 
 def parse_smtp(banner):
         components = {}
-        pattern = r'([A-Za-z0-9]*\.[A-Za-z0-9]*)\s[A-Za-z0-9]*\s([A-Za-z0-9]*)\s\(([A-Za-z0-9]*)\)'
+        pattern = r'(?:220[- ]\S+\s+)?(?:ESMTP\s+)?([A-Za-z0-9\.\-_]+?)(?:/|\s+v?|\s*\()(\d+(?:\.[A-Za-z0-9\._\-]+)+)'
         match = re.search(pattern, banner)
-        components["Hostname"] = match.group(1) if match and match.group(1) else "Unknown"
-        components["Service"] = match.group(2) if match and match.group(2) else "Unknown"
-        components["OS"] = match.group(3) if match and match.group(3) else "Unknown"
+        components["Product"] = match.group(1) if match and match.group(1) else "Unknown"
+        components["Version"] = match.group(2) if match and match.group(2) else "Unknown"
         return components
 
 def parse_sql(banner):
         components = {}
-        pattern = r'(\d+\.\d+\.[a-z0-9]*)-(\d[A-Za-z]*\d)'
+        pattern = r'(?:([A-Za-z0-9\._\-]+)\s+)?v?(\d+\.\d+\.[0-9a-z]+)'
         match = re.search(pattern, banner)
-        components["Version"] = match.group(1) if match and match.group(1) else "Unknown"
-        components["OS_Version"] = match.group(2) if match and match.group(2) else "Unknown"
+        components["Product"] = match.group(1) if match and match.group(1) else "mysql"
+        components["Version"] = match.group(2) if match and match.group(2) else "Unknown"
         return components
 
 def parse_telnet(banner):
         components = {}
-        product_pattern = r'([A-Za-z0-9]*)\s([A-Za-z0-9]*)?(\s[A-Za-z0-9]+),\s([A-Za-z0-9]*)'
-        version_pattern = r'Version\s+([0-9A-Za-z.()]+)'
-        match_product = re.search(product_pattern, banner)
-        match_version = re.search(version_pattern, banner)
-        components["Vendor"] = match_product.group(1) if match_product and match_product.group(1) else "Unknown"
-        components["Product"] = match_product.group(2) if match_product and match_product.group(2) else "Unknown"
-        components["Version"] = match_version.group(1) if match_version and match_version.group(1) else "Unknown"
+        pattern = r'(?i)\b([A-Za-z0-9\._\-/]+?)\s+(?:v(?:ersion)?[\s/]*|Software,?\s+)?([\d\.]+(?:\([\d\w\.-]+\))?[\w\.-]*)'
+        match = re.search(pattern, banner)
+        components["Product"] = match.group(1) if match and match.group(2) else "Unknown"
+        components["Version"] = match.group(2) if match and match.group(1) else "Unknown"
         return components
 
 def parse_smb(banner):
         components = {}
-        pattern = r'Samba\s(\d+(?:\.\d+)+[a-z]?)(?:[-_\s\(]+([A-Za-z0-9.]+)\)?)?'
+        pattern = r'(?i)\b(Samba)\b\s+v?(\d+(?:\.\d+)+[a-z]?)(?:[-_\s\(]+([A-Za-z0-9.]+)\)?)?'
         match = re.search(pattern, banner)
         components["Product"] = "samba"
         components["Version"] = match.group(1) if match and match.group(1) else "Unknown"
         components["OS"] = match.group(2) if match and match.group(2) else "Unknown"
         return components
-        
+
+def parse_banner(port, banner):
+        if port == 22:
+                return parse_ssh(banner)
+        elif port in [80, 8080, 8000, 8888, 443, 8443, 9443]:
+                return parse_http(banner)
+        elif port == 21:
+                return parse_ftp(banner)
+        elif port == 25:
+                return parse_smtp(banner)
+        elif port == 3306:
+                return parse_sql(banner)
+        elif port == 23:
+                return parse_telnet(banner)
+        elif port in [139, 445]:
+                return parse_smb(banner)
+        else:
+                return {"Raw": banner}
+
+def load_cpe_mapping():
+        with open('data/cpe_mapping.json','r') as f:
+                mapping = json.load(f)
+        return mapping
+
+def build_cpe(product, version, language, part="a"):
+        product = product.strip().lower()
+        version = version.strip().lower()
+        language = language.strip().lower()
+        if product == "unknown" or not product:
+                print("[CRITICAL] Product could not be determined from captured banner. CPE is not constructable. Aborting.")
+                return False
+        if version == "unknown" or not version:
+                print("\nVersion could not be determined from captured banner. Showing general vulnerabilities of specified product")
+                version = "*"
+        if language == "unknown" or not language:
+                print("\n[MINOR] Language could not be determined")
+        key = product
+        mapping = load_cpe_mapping()
+        entry = mapping.get(key)
+        if entry is None:
+                print("[CRITICAL] Product not found in database. You can add it to data/cpe_mapping.json")
+                return False
+        cpe_string = f"cpe:2.3:{part}:{entry['vendor']}:{entry['product']}:{version}:*:*:*:*:*:*:*"
+        return cpe_string
+
+
+def fetch_nvd_data(cpe_string):
+        if not cpe_string:
+                return None
+        url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+        params = {"cpeName": cpe_string}
+        headers = {}
+        if NVD_API_KEY:
+                headers["apiKey"] = NVD_API_KEY
+        try:
+                response = requests.get(url, params=params, headers=headers, timeout=10)
+                if response.status_code == 200:
+                        data = response.json()
+                        return data
+                else:
+                        return None
+        except requests.RequestException as e:
+                print(f"Eroare: {e}")
+                return None
+
+def extract_vulnerabilities(data):
+        vulnerabilities = []
+        for item in data.get("vulnerabilities", []):
+                cve_data = item.get("cve", {})
+                cve_id = cve_data.get("id", "-")
+
+                description = cve_data["descriptions"][0]["value"]
+
+                score = 0.0
+                severity = "UNKNOWN"
+
+                metrics = cve_data.get("metrics",{})
+                if "cvssMetricV31" in metrics:
+                        metric = metrics["cvssMetricV31"][0]
+                        score = metric.get("cvssData", {}).get("baseScore", 0.0)
+                        severity = metric.get("cvssData", {}).get("baseSeverity", "N/A")
+                elif "cvssMetricV30" in metrics:
+                        metric = metrics["cvssMetricV30"][0]
+                        score = metric.get("cvssData", {}).get("baseScore", 0.0)
+                        severity = metric.get("cvssData", {}).get("baseSeverity", "N/A")
+                elif "cvssMetricV2" in metrics:
+                        metric = metrics["cvssMetricV2"][0]
+                        score = metric.get("cvssData", {}).get("baseScore", 0.0)
+                        severity = metric.get("baseSeverity", "N/A")
+
+                vulnerabilities.append({
+                        "cve_id": cve_id,
+                        "description": description,
+                        "severity": severity,
+                        "baseScore": score
+                })
+
+        vulnerabilities.sort(key=lambda x: x["baseScore"], reverse=True)
+        return vulnerabilities
+
+
+def display_vulnerabilities(data):
+        print(f'\nA total of {data["totalResults"]} have been found. Showing top {vuln_count} vulnerabilities, sorted by CVSS rating')
+        vulnerabilities = extract_vulnerabilities(data)
+        for vuln in vulnerabilities[:vuln_count]:
+                print(f'\n==========================================================================')
+                print(f'Vulnerability: {vuln["cve_id"]} (https://www.cve.org/CVERecord?id={vuln["cve_id"]})')
+                print(f'Severity: {vuln["severity"]} (CVSS Score: {vuln["baseScore"]})')
+                print("\nDescription:")
+                print(vuln["description"])
+
 def run():
-        banner = "Samba 4.15.13 (Debian)"
-        components = parse_smb(banner)
-        print(components)
+        banner = "SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1"
+        port = 22
+        components = parse_banner(port, banner)
+        cpe_string = build_cpe(components["Product"],components["Version"],components.get("Language","*"),"a")
+        print(cpe_string)
+        data = fetch_nvd_data(cpe_string)
+        display_vulnerabilities(data)
 
 if __name__ == "__main__":
     run()
-
-"""
-def run():
-       global services, valid_hosts
-       initial_scan()
-       initialize_ports()
-       initial_port_find()
-       services = load_services()
-       store_banners()
-       banners_sorted = {
-        HOST: dict(sorted(banners[HOST].items()))
-        for HOST in sorted(banners)
-}
-       print(banners_sorted)
-
-if __name__ == "__main__":
-    run()
-"""
