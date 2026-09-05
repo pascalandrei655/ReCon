@@ -12,10 +12,13 @@ import ssl
 import os
 from dotenv import load_dotenv
 import requests
+from colorama import Fore, Style, init, Back
+import time
 
 load_dotenv()
 NVD_API_KEY = os.getenv("NVD_API_KEY")
 
+init(autoreset=True)
 
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
@@ -32,6 +35,20 @@ parser = argparse.ArgumentParser(
         epilog="Thank you for trying %(prog)s! =P"
 )
 
+ANSI_PATTERN = re.compile(r'\033\[[0-9;]*m')
+
+class Tee:
+        def __init__(self, console_stream, file_stream):
+                self.console_stream = console_stream
+                self.file_stream = file_stream
+        def write(self, text):
+                self.console_stream.write(text)
+                clean_text = ANSI_PATTERN.sub('', text)
+                self.file_stream.write(clean_text)
+        def flush(self):
+                self.console_stream.flush()
+                self.file_stream.flush()
+
 mandatory = parser.add_argument_group("Mandatory arguments")
 mandatory.add_argument("-H", "--host", help="Host to perform the scan on. Eg: 192.168.56.101", required=True)
 
@@ -39,6 +56,11 @@ optional = parser.add_argument_group("Optional arguments")
 optional.add_argument("-t", "--timing", help="1 - Stealthy; 2 - Calm; 3 - Normal; 4 - Fast; 5 - Aggressive")
 optional.add_argument("-p", "--port", help="Ports to scan. Eg: 80; 21,22,80; 1-1023")
 optional.add_argument("-c", "--vuln-count", help="Number of vulnerabilities to show. Defaults to 10")
+optional.add_argument("-o", "--output", help="Save the contents of the scan to a file. Eg: scan.txt")
+optional.add_argument("--attack-vector", choices=["NETWORK", "ADJACENT", "LOCAL", "PHYSICAL"])
+optional.add_argument("--attack-complexity", choices=["LOW", "HIGH"])
+optional.add_argument("--user-interaction", choices=["NONE", "REQUIRED"])
+optional.add_argument("--privileges-required", choices=["NONE","REQUIRED"])
 
 args = parser.parse_args()
 
@@ -48,6 +70,12 @@ timing = args.timing
 vuln_count = args.vuln_count
 if vuln_count is None:
         vuln_count = 10
+output = args.output
+attack_vector = args.attack_vector
+attack_complexity = args.attack_complexity
+user_interaction = args.user_interaction
+attack_vector = args.attack_vector
+privileges_required = args.privileges_required
 
 valid_hosts = set()
 scanned_hosts = []
@@ -55,6 +83,7 @@ scanned_ports = []
 open_ports_by_host = dict()
 hostname_map = dict()
 banners = dict()
+
 
 portPattern = r'^\d+(-\d+)?(,\d+(-\d+)?)*$'
 
@@ -254,12 +283,12 @@ def grab_banner(HOST, PORT):
 
 def store_banners():
        global open_ports_by_host
-       for HOST in scanned_hosts:
+       for HOST in sorted(scanned_hosts):
               banners[HOST] = {}
               printed_host = hostname_map.get(HOST, HOST)
               print(f"\nExecuting banner grab scan on host {printed_host}.")
               with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
-                     for PORT in open_ports_by_host[HOST]:
+                     for PORT in sorted(open_ports_by_host[HOST]):
                             executor.submit(grab_banner, HOST, PORT)
 
 def split_banner_lines(banner):
@@ -291,13 +320,14 @@ def parse_http(banner):
         backend_line = find_backend(lines)
         components = {}
         if server_line:
+                server_line = server_line.split(":", 1)[1].strip()
                 server_pattern = r'([A-Za-z\-]*)(?:/(\d+\.\d+(?:\.\d+)?))?'
                 server_match = re.search(server_pattern, server_line)
-                components["Server"] = server_match.group(1) if server_match and server_match.group(1) else "Unknown"
-                components["Server_Version"] = server_match.group(2) if server_match and server_match.group(2) else "Unknown"
+                components["Product"] = server_match.group(1) if server_match and server_match.group(1) else "Unknown"
+                components["Version"] = server_match.group(2) if server_match and server_match.group(2) else "Unknown"
         else:
-                components["Server"] = "Unknown"
-                components["Server_Version"] = "Unknown"
+                components["Product"] = "Unknown"
+                components["Version"] = "Unknown"
         if backend_line:
                 backend_pattern = r'([A-Za-z\.\-]+)(?:/(\d+(?:\.\d+)*?)(?:-([A-Za-z0-9\.\-]*))?)?'
                 backend_match = re.search(backend_pattern, backend_line)
@@ -314,13 +344,13 @@ def parse_ftp(banner):
         components = {}
         pattern = r'([A-Za-z0-9\.\-]+)\s+v?(\d+(?:\.\d+)+)'
         match = re.search(pattern, banner)
-        components["Server"] = match.group(1) if match and match.group(1) else "Unknown"
+        components["Product"] = match.group(1) if match and match.group(1) else "Unknown"
         components["Version"] = match.group(2) if match and match.group(2) else "Unknown"
         return components
 
 def parse_smtp(banner):
         components = {}
-        pattern = r'(?:220[- ]\S+\s+)?(?:ESMTP\s+)?([A-Za-z0-9\.\-_]+?)(?:/|\s+v?|\s*\()(\d+(?:\.[A-Za-z0-9\._\-]+)+)'
+        pattern = r'(?:220[- ]\S+\s+)?(?:ESMTP\s+)?([A-Za-z0-9\.\-_]+?)(?:/|\s+v?|\s*\()(\d+(?:\.[A-Za-z0-9\._\-]+)+)?'
         match = re.search(pattern, banner)
         components["Product"] = match.group(1) if match and match.group(1) else "Unknown"
         components["Version"] = match.group(2) if match and match.group(2) else "Unknown"
@@ -338,8 +368,8 @@ def parse_telnet(banner):
         components = {}
         pattern = r'(?i)\b([A-Za-z0-9\._\-/]+?)\s+(?:v(?:ersion)?[\s/]*|Software,?\s+)?([\d\.]+(?:\([\d\w\.-]+\))?[\w\.-]*)'
         match = re.search(pattern, banner)
-        components["Product"] = match.group(1) if match and match.group(2) else "Unknown"
-        components["Version"] = match.group(2) if match and match.group(1) else "Unknown"
+        components["Product"] = match.group(1) if match and match.group(1) else "Unknown"
+        components["Version"] = match.group(2) if match and match.group(2) else "Unknown"
         return components
 
 def parse_smb(banner):
@@ -347,8 +377,8 @@ def parse_smb(banner):
         pattern = r'(?i)\b(Samba)\b\s+v?(\d+(?:\.\d+)+[a-z]?)(?:[-_\s\(]+([A-Za-z0-9.]+)\)?)?'
         match = re.search(pattern, banner)
         components["Product"] = "samba"
-        components["Version"] = match.group(1) if match and match.group(1) else "Unknown"
-        components["OS"] = match.group(2) if match and match.group(2) else "Unknown"
+        components["Version"] = match.group(2) if match and match.group(2) else "Unknown"
+        components["OS"] = match.group(3) if match and match.group(3) else "Unknown"
         return components
 
 def parse_banner(port, banner):
@@ -374,23 +404,20 @@ def load_cpe_mapping():
                 mapping = json.load(f)
         return mapping
 
-def build_cpe(product, version, language, part="a"):
+def build_cpe(product, version, part="a"):
         product = product.strip().lower()
         version = version.strip().lower()
-        language = language.strip().lower()
         if product == "unknown" or not product:
-                print("[CRITICAL] Product could not be determined from captured banner. CPE is not constructable. Aborting.")
+                print("[IMPORTANT] Product could not be determined from captured banner. CPE is not constructable. Aborting.")
                 return False
         if version == "unknown" or not version:
-                print("\nVersion could not be determined from captured banner. Showing general vulnerabilities of specified product")
+                print("\n[IMPORTANT] Version could not be determined from captured banner.")
                 version = "*"
-        if language == "unknown" or not language:
-                print("\n[MINOR] Language could not be determined")
         key = product
         mapping = load_cpe_mapping()
         entry = mapping.get(key)
         if entry is None:
-                print("[CRITICAL] Product not found in database. You can add it to data/cpe_mapping.json")
+                print("[IMPORTANT] Product not found in database. You can add it to data/cpe_mapping.json")
                 return False
         cpe_string = f"cpe:2.3:{part}:{entry['vendor']}:{entry['product']}:{version}:*:*:*:*:*:*:*"
         return cpe_string
@@ -425,50 +452,122 @@ def extract_vulnerabilities(data):
 
                 score = 0.0
                 severity = "UNKNOWN"
+                vector = "N/A"
+                complexity = "N/A"
+                interaction = "N/A"
+                privileges = "N/A"
 
                 metrics = cve_data.get("metrics",{})
                 if "cvssMetricV31" in metrics:
                         metric = metrics["cvssMetricV31"][0]
                         score = metric.get("cvssData", {}).get("baseScore", 0.0)
                         severity = metric.get("cvssData", {}).get("baseSeverity", "N/A")
+                        vector = metric.get("cvssData", {}).get("attackVector", "N/A")
+                        complexity = metric.get("cvssData", {}).get("attackComplexity", "N/A")
+                        interaction = metric.get("cvssData", {}).get("userInteraction", "N/A")
+                        privileges = metric.get("cvssData", {}).get("privilegesRequired", "N/A")
                 elif "cvssMetricV30" in metrics:
                         metric = metrics["cvssMetricV30"][0]
                         score = metric.get("cvssData", {}).get("baseScore", 0.0)
                         severity = metric.get("cvssData", {}).get("baseSeverity", "N/A")
+                        vector = metric.get("cvssData", {}).get("attackVector", "N/A")
+                        complexity = metric.get("cvssData", {}).get("attackComplexity", "N/A")
+                        interaction = metric.get("cvssData", {}).get("userInteraction", "N/A")
+                        privileges = metric.get("cvssData", {}).get("privilegesRequired", "N/A")
                 elif "cvssMetricV2" in metrics:
                         metric = metrics["cvssMetricV2"][0]
                         score = metric.get("cvssData", {}).get("baseScore", 0.0)
                         severity = metric.get("baseSeverity", "N/A")
+                        vector = metric.get("cvssData", {}).get("accessVector", "N/A")
+                        complexity = metric.get("cvssData", {}).get("accessComplexity", "N/A")
+                        interaction = "REQUIRED" if metric.get("userInteractionRequired", False) else "NONE"
+                        privileges = "N/A"
 
                 vulnerabilities.append({
                         "cve_id": cve_id,
                         "description": description,
                         "severity": severity,
-                        "baseScore": score
+                        "baseScore": score,
+                        "vector": vector,
+                        "complexity": complexity,
+                        "interaction": interaction ,
+                        "privileges": privileges
                 })
 
         vulnerabilities.sort(key=lambda x: x["baseScore"], reverse=True)
         return vulnerabilities
 
+def filter_vulnerabilities(vulnerabilities):
+        filtered = []
+        for vuln in vulnerabilities:
+                if attack_vector and attack_vector != vuln["vector"]:
+                        continue
+                if attack_complexity and attack_complexity != vuln["complexity"]:
+                        continue
+                if user_interaction and user_interaction != vuln["interaction"]:
+                        continue
+                if privileges_required and privileges_required != vuln["privileges"]:
+                        continue
+                filtered.append(vuln)
+        return filtered
+
 
 def display_vulnerabilities(data):
-        print(f'\nA total of {data["totalResults"]} have been found. Showing top {vuln_count} vulnerabilities, sorted by CVSS rating')
+        print(f'\nA total of {data["totalResults"]} vulnerabilities have been found. (pre-filtering)')
         vulnerabilities = extract_vulnerabilities(data)
-        for vuln in vulnerabilities[:vuln_count]:
-                print(f'\n==========================================================================')
-                print(f'Vulnerability: {vuln["cve_id"]} (https://www.cve.org/CVERecord?id={vuln["cve_id"]})')
-                print(f'Severity: {vuln["severity"]} (CVSS Score: {vuln["baseScore"]})')
-                print("\nDescription:")
-                print(vuln["description"])
+        vulnerabilities = filter_vulnerabilities(vulnerabilities)
+        if vulnerabilities == []:
+                print("No vulnerabilities that match the filters have been found")
+        else:
+                print(f'Showing top {min(int(vuln_count),len(vulnerabilities))} vulnerabilities, sorted by CVSS rating, post-filtering')
+                for vuln in vulnerabilities[:int(vuln_count)]:
+                        print(f'\n==========================================================================')
+                        print(f'{Fore.RED}{Back.YELLOW}Vulnerability:{Style.RESET_ALL} {vuln["cve_id"]} (https://www.cve.org/CVERecord?id={vuln["cve_id"]})')
+                        print(f'Severity: {vuln["severity"]} (CVSS Score: {vuln["baseScore"]})')
+                        print(f'Attack Vector: {vuln["vector"]}')
+                        print(f'Attack Complexity: {vuln["complexity"]}')
+                        print(f'Privileges Required: {vuln["privileges"]}')
+                        print(f'User Interaction: {vuln["interaction"]}')
+                        print("\nDescription:")
+                        print(vuln["description"])
 
 def run():
-        banner = "SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1"
-        port = 22
-        components = parse_banner(port, banner)
-        cpe_string = build_cpe(components["Product"],components["Version"],components.get("Language","*"),"a")
-        print(cpe_string)
-        data = fetch_nvd_data(cpe_string)
-        display_vulnerabilities(data)
+        if output:
+                file_stream = open(output,"w", encoding="utf-8")
+                sys.stdout = Tee(sys.stdout, file_stream)
+        try:
+                load_ports("data/top_tcp_ports.txt")
+                services = load_services()
+                initialize_ports()
+                initial_scan()
+                initial_port_find()
+                store_banners()
+
+                sorted_hosts = sorted(banners.keys(), key=lambda h: ipaddress.ip_address(h))
+
+                for HOST in sorted_hosts:
+                        print("\n=================================================================")
+                        print(f"Banners/Vulnerabilities for host: {HOST}")
+                        print("=================================================================")
+                        sorted_ports = sorted(banners[HOST].keys(), key=lambda p: int(p))
+                        for PORT in sorted_ports:
+                                print(f"\n{Back.GREEN}{Fore.BLACK}Banner for port {PORT}{Style.RESET_ALL} (Likely {services["tcp"].get(str(PORT)) or "Unknown"}):")
+                                print(banners[HOST][PORT])
+                                if int(PORT) not in [21, 22, 23, 25, 80, 139, 445, 8080, 8000, 8888, 443, 8443, 9443, 3306]:
+                                        print("\nVulnerability matcher is not available for this port")
+                                else:
+                                        components = parse_banner(int(PORT), banners[HOST][PORT])
+                                        cpe_string = build_cpe(components["Product"], components["Version"], "a")
+                                        time.sleep(0.6)
+                                        data = fetch_nvd_data(cpe_string)
+                                        if(data is None):
+                                                print(f"Vulnerability data could not be found for port {PORT}")
+                                        else:
+                                                display_vulnerabilities(data)
+                                                print("-----------------------------------------------------------------------")
+        finally:
+                sys.stdout = sys.stdout.console_stream
+                file_stream.close()
 
 if __name__ == "__main__":
     run()
