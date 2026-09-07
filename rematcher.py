@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import requests
 from colorama import Fore, Style, init, Back
 import time
+import scanlib
 
 load_dotenv()
 NVD_API_KEY = os.getenv("NVD_API_KEY")
@@ -77,16 +78,12 @@ user_interaction = args.user_interaction
 attack_vector = args.attack_vector
 privileges_required = args.privileges_required
 
-valid_hosts = set()
-scanned_hosts = []
-scanned_ports = []
+ctx = scanlib.ScanContext(timing=timing)
+
 open_ports_by_host = dict()
-hostname_map = dict()
 banners = dict()
 
-
 portPattern = r'^\d+(-\d+)?(,\d+(-\d+)?)*$'
-
 
 TIMING_PROFILES = {
         "1": {"timeout": 3.0, "workers": 5},
@@ -95,85 +92,9 @@ TIMING_PROFILES = {
         "4": {"timeout": 0.5, "workers": 100},
         "5": {"timeout": 0.3, "workers": 200}
 }
-
-def get_timing_profile():
-        if timing is None:
-                return TIMING_PROFILES["3"]
-        if timing not in TIMING_PROFILES:
-                print("Timing options: 1 - Stealthy; 2 - Calm; 3 - Normal; 4 - Fast; 5 - Aggressive")
-                sys.exit(1)
-        return TIMING_PROFILES[timing]
-
-timing_profile = get_timing_profile()
-
-def is_hostname(HOST):
-        try:
-                ipaddress.ip_address(HOST)
-                return False
-        except ValueError:
-                return True
-
-def load_ports(filepath):
-        with open(filepath,'r') as f:
-                return [int(line.strip()) for line in f if line.strip()]
-
-def load_services():
-        with open('data/services.json', 'r') as f:
-                services = json.load(f)
-        return services
-
-def parse_hosts(HOST):
-        parts = HOST.split(',')
-        global scanned_hosts
-        for part in parts:
-                if(is_hostname(part)):
-                        try:
-                                hostname_map[socket.gethostbyname(part)] = part
-                                part = socket.gethostbyname(part)                     
-                                try:
-                                        arping(part, timeout=timing_profile["timeout"], verbose=0)
-                                        ip = ipaddress.ip_address(part)
-                                        scanned_hosts.append(str(ip))
-                                except ValueError:
-                                        print(f"Invalid IP address:{part}")
-                                        return      
-                        except socket.gaierror:
-                                print(f"Could not resolve hostname: {part}")
-                                continue
-                elif '-' in part:
-                        try:
-                                arping(part, timeout=timing_profile["timeout"], verbose=0)
-                                start_ip = ipaddress.ip_address(part.split('-')[0])
-                                end_ip = ipaddress.ip_address(part.split('-')[1])
-                                if(start_ip > end_ip):
-                                        print("Invalid IP Range")
-                                        return
-                                current_ip = start_ip
-                                while current_ip <= end_ip:
-                                        scanned_hosts.append(str(current_ip))
-                                        current_ip = current_ip + 1
-                        except ValueError:
-                                print("Invalid IP format")
-                                return
-                elif '/' in part:
-                        try:
-                                arping(part, timeout=timing_profile["timeout"], verbose=0)
-                                net = ipaddress.ip_network(part, strict=False)
-                                for ip in net.hosts():
-                                        scanned_hosts.append(str(ip))
-                        except ValueError:
-                                print("Invalid CIDR format")
-                                return
-                else:
-                        try:
-                                arping(part, timeout=timing_profile["timeout"], verbose=0)
-                                ip = ipaddress.ip_address(part)
-                                scanned_hosts.append(str(ip))
-                        except ValueError:
-                                print(f"Invalid IP address:{part}")
-                                return     
+                         
 def initialize_ports():
-        global ports, TCP_PORTS, UDP_PORTS, scanned_ports, valid_ports
+        global ports, TCP_PORTS, UDP_PORTS
         if(ports!=None):
                 if(re.fullmatch(portPattern,ports) == None):
                         print("Thrown error - port argument doesn't match the supported format")
@@ -186,63 +107,28 @@ def initialize_ports():
                                         start = int(part.split('-')[0])
                                         end = int(part.split('-')[1])
                                         for i in range(start,end+1):
-                                                scanned_ports.append(i)
+                                                ctx.scanned_ports.append(i)
                                 else:
-                                        scanned_ports.append(int(part))  
+                                                ctx.scanned_ports.append(int(part))  
         else:
-                scanned_ports = load_ports("data/top_tcp_ports.txt")
-
-def host_scan(HOST):
-        global valid_hosts
-        try:
-                packet = IP(dst=HOST) / ICMP()
-                response = sr1(packet, timeout=timing_profile["timeout"], verbose=0)
-                if response and response.haslayer(ICMP) and response.getlayer(ICMP).type == 0:
-                        valid_hosts.add(HOST)
-                        return
-                packet = IP(dst=HOST) / TCP(dport=443, flags='S')
-                response = sr1(packet, timeout=timing_profile["timeout"], verbose=0)
-                if(response and response.haslayer(TCP) and response[TCP].flags == 'SA'):
-                        valid_hosts.add(HOST)
-                        return
-                packet = IP(dst=HOST) / TCP(dport=80, flags='A')
-                response = sr1(packet, timeout=timing_profile["timeout"], verbose=0)
-                if(response and response.haslayer(TCP) and response[TCP].flags == 'R'):
-                        valid_hosts.add(HOST)
-                        return
-                packet = IP(dst=HOST) / ICMP(type=13)
-                response = sr1(packet, timeout=timing_profile["timeout"], verbose=0)
-                if(response and response.haslayer(ICMP) and response.getlayer(ICMP).type == 14):
-                        valid_hosts.add(HOST)
-                        return
-        except Exception as e:
-                pass
+                ctx.scanned_ports = scanlib.load_ports("data/top_tcp_ports.txt")
         
 def initial_scan():           
-        parse_hosts(args.host)
-        with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
-                for HOST in scanned_hosts:
-                        executor.submit(host_scan, HOST)
-
-def tcp_scan_port(HOST, PORT):
-        global open_ports_by_host
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timing_profile["timeout"])
-        try:
-                s.connect((HOST,PORT))
-                open_ports_by_host[HOST].append(PORT)
-        except:
-                pass
+        scanlib.parse_hosts(args.host, ctx)
+        with ThreadPoolExecutor(max_workers=ctx.timing_profile["workers"]) as executor:
+                for HOST in ctx.scanned_hosts:
+                        executor.submit(scanlib.host_scan, HOST, ctx)
 
 def initial_port_find():
-        global open_ports_by_host, scanned_ports
-        for HOST in sorted(valid_hosts):
-                printed_host = hostname_map.get(HOST, HOST)
+        global open_ports_by_host
+        for HOST in sorted(ctx.valid_hosts):
+                printed_host = ctx.hostname_map.get(HOST, HOST)
                 open_ports_by_host[HOST] = []
                 print(f"\nExecuting initial scan on host {printed_host}.")
-                with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
-                        for PORT in scanned_ports:
-                                executor.submit(tcp_scan_port, HOST, PORT)
+                with ThreadPoolExecutor(max_workers=ctx.timing_profile["workers"]) as executor:
+                        for PORT in ctx.scanned_ports:
+                                executor.submit(scanlib.tcp_scan_port, HOST, PORT, ctx)
+                open_ports_by_host[HOST] = list(ctx.open_ports)
 
 def grab_banner(HOST, PORT):
         global banners
@@ -251,7 +137,7 @@ def grab_banner(HOST, PORT):
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
                 raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                raw_sock.settimeout(timing_profile["timeout"])
+                raw_sock.settimeout(ctx.timing_profile["timeout"])
                 s = context.wrap_socket(raw_sock, server_hostname=HOST)
                 try:
                         s.connect((HOST, int(PORT)))
@@ -267,7 +153,7 @@ def grab_banner(HOST, PORT):
         else:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         try:
-                                s.settimeout(timing_profile["timeout"])
+                                s.settimeout(ctx.timing_profile["timeout"])
                                 s.connect((HOST, int(PORT)))
                                 request = ''
                                 if int(PORT) in [80,8080,8000,8888]:
@@ -283,11 +169,12 @@ def grab_banner(HOST, PORT):
 
 def store_banners():
        global open_ports_by_host
-       for HOST in sorted(scanned_hosts):
-              banners[HOST] = {}
-              printed_host = hostname_map.get(HOST, HOST)
+       for HOST in sorted(ctx.scanned_hosts):
+              if HOST not in banners:
+                banners[HOST] = {}
+              printed_host = ctx.hostname_map.get(HOST, HOST)
               print(f"\nExecuting banner grab scan on host {printed_host}.")
-              with ThreadPoolExecutor(max_workers=timing_profile["workers"]) as executor:
+              with ThreadPoolExecutor(max_workers=ctx.timing_profile["workers"]) as executor:
                      for PORT in sorted(open_ports_by_host[HOST]):
                             executor.submit(grab_banner, HOST, PORT)
 
@@ -536,8 +423,8 @@ def run():
                 file_stream = open(output,"w", encoding="utf-8")
                 sys.stdout = Tee(sys.stdout, file_stream)
         try:
-                load_ports("data/top_tcp_ports.txt")
-                services = load_services()
+                scanlib.load_ports("data/top_tcp_ports.txt")
+                services = scanlib.load_services()
                 initialize_ports()
                 initial_scan()
                 initial_port_find()
@@ -566,8 +453,9 @@ def run():
                                                 display_vulnerabilities(data)
                                                 print("-----------------------------------------------------------------------")
         finally:
-                sys.stdout = sys.stdout.console_stream
-                file_stream.close()
+                if output and file_stream:
+                        sys.stdout = sys.stdout.console_stream
+                        file_stream.close()
 
 if __name__ == "__main__":
     run()
